@@ -20,6 +20,7 @@ if is_e2b_available():
 
 
 def accuracy_reward(completions, solution, **kwargs):
+    assert False
     """Reward function that checks if the completion is the same as the ground truth."""
     contents = [completion[0]["content"] for completion in completions]
     rewards = []
@@ -60,6 +61,52 @@ def accuracy_reward(completions, solution, **kwargs):
             # If the gold solution is not parseable, we reward 1 to skip this example
             reward = 1.0
             print("Failed to parse gold solution: ", sol)
+        rewards.append(reward)
+
+    return rewards
+
+
+def accuracy_reward_gsm8k(completions, answer, **kwargs):
+    """Reward function that checks if the completion is the same as the ground truth."""
+    contents = [completion[0]["content"] for completion in completions]
+    rewards = []
+    for content, sol in zip(contents, answer):
+        if '#### ' in sol:
+            gold_parsed = [sol.split('#### ')[-1]]
+        else:
+            gold_parsed = parse(
+                sol,
+                extraction_mode="first_match",
+                extraction_config=[LatexExtractionConfig()],
+            )
+        if len(gold_parsed) != 0:
+            # We require the answer to be provided in correct latex (no malformed operators)
+            answer_parsed = parse(
+                content,
+                extraction_config=[
+                    LatexExtractionConfig(
+                        normalization_config=NormalizationConfig(
+                            nits=False,
+                            malformed_operators=False,
+                            basic_latex=True,
+                            equations=True,
+                            boxed="all",
+                            units=True,
+                        ),
+                        # Ensures that boxed is tried first
+                        boxed_match_priority=0,
+                        try_extract_without_anchor=False,
+                    )
+                ],
+                extraction_mode="first_match",
+            )
+            # Reward 1 if the content is the same as the ground truth, 0 otherwise
+            reward = float(verify(answer_parsed, gold_parsed))
+        else:
+            # If the gold solution is not parseable, we reward 1 to skip this example
+            reward = 1.0
+            raise ValueError("Failed to parse gold solution: ", sol)
+            # print("Failed to parse gold solution: ", sol)
         rewards.append(reward)
 
     return rewards
@@ -112,6 +159,25 @@ def reasoning_steps_reward(completions, **kwargs):
     return [min(1.0, count / 3) for count in matches]
 
 
+def reasoning_steps_reward_gsm8k(completions, **kwargs):
+    r"""Reward function that checks for clear step-by-step reasoning.
+    Regex pattern:
+        Step \d+: - matches "Step 1:", "Step 2:", etc.
+        ^\d+\. - matches numbered lists like "1.", "2.", etc. at start of line
+        \n- - matches bullet points with hyphens
+        \n\* - matches bullet points with asterisks
+        First,|Second,|Next,|Finally, - matches transition words
+    """
+    pattern = (
+        r"(Step \d+:|^\d+\.|\n-|\n\*|First|Next|Then|Finally|So|Now|Since|If|When)"
+    )
+    completion_contents = [completion[0]["content"] for completion in completions]
+    matches = [len(re.findall(pattern, content)) for content in completion_contents]
+
+    # Magic number 3 to encourage 3 steps and more, otherwise partial reward
+    return [min(1.0, count / 3) for count in matches]
+
+
 def len_reward(completions: list[Dict[str, str]], solution: list[str], **kwargs) -> float:
     """Compute length-based rewards to discourage overthinking and promote token efficiency.
 
@@ -126,6 +192,7 @@ def len_reward(completions: list[Dict[str, str]], solution: list[str], **kwargs)
         - For correct answers: reward = 0.5 - (len - min_len)/(max_len - min_len)
         - For incorrect answers: reward = min(0, 0.5 - (len - min_len)/(max_len - min_len))
     """
+    assert False
     contents = [completion[0]["content"] for completion in completions]
 
     # First check correctness of answers

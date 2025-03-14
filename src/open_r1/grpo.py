@@ -21,12 +21,14 @@ import datasets
 import torch
 import transformers
 from datasets import load_dataset
-from transformers import set_seed
+from transformers import AutoModelForCausalLM, set_seed
 from transformers.trainer_utils import get_last_checkpoint
 
+from coht.coht import LMWrapper
 from open_r1.configs import GRPOConfig
 from open_r1.rewards import (
     accuracy_reward,
+    accuracy_reward_gsm8k,
     code_reward,
     format_reward,
     get_code_format_reward,
@@ -34,12 +36,19 @@ from open_r1.rewards import (
     get_repetition_penalty_reward,
     len_reward,
     reasoning_steps_reward,
+    reasoning_steps_reward_gsm8k,
     tag_count_reward,
 )
 from open_r1.utils import get_tokenizer
 from open_r1.utils.callbacks import get_callbacks
 from open_r1.utils.wandb_logging import init_wandb_training
-from trl import GRPOTrainer, ModelConfig, ScriptArguments, TrlParser, get_peft_config
+from trl import (
+    GRPOTrainer,
+    ModelConfig,
+    ScriptArguments,
+    TrlParser,
+    get_peft_config,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -158,7 +167,6 @@ def main(script_args, training_args, model_args):
 
     # Get reward functions
     REWARD_FUNCS_REGISTRY = {
-        "accuracy": accuracy_reward,
         "format": format_reward,
         "reasoning_steps": reasoning_steps_reward,
         "cosine": get_cosine_scaled_reward(
@@ -172,11 +180,25 @@ def main(script_args, training_args, model_args):
             ngram_size=script_args.repetition_n_grams,
             max_penalty=script_args.repetition_max_penalty,
         ),
-        "length": len_reward,
         "code": code_reward,
         "code_format": get_code_format_reward(language=script_args.code_language),
         "tag_count": tag_count_reward,
     }
+
+    match script_args.dataset_name.split("/")[-1]:
+        case "OpenR1-Math-220k":
+            REWARD_FUNCS_REGISTRY["accuracy"] = accuracy_reward
+            REWARD_FUNCS_REGISTRY["length"] = len_reward
+            REWARD_FUNCS_REGISTRY["reasoning_steps"] = reasoning_steps_reward
+        case "gsm8k":
+            REWARD_FUNCS_REGISTRY["accuracy"] = accuracy_reward_gsm8k
+            REWARD_FUNCS_REGISTRY["reasoning_steps"] = reasoning_steps_reward_gsm8k
+        case _:
+            raise ValueError(f"Dataset {script_args.dataset_name} not supported")
+            import pdb
+
+            pdb.set_trace()
+
     reward_funcs = [REWARD_FUNCS_REGISTRY[func] for func in script_args.reward_funcs]
 
     # Format into conversation
@@ -186,7 +208,18 @@ def main(script_args, training_args, model_args):
         if training_args.system_prompt is not None:
             prompt.append({"role": "system", "content": training_args.system_prompt})
 
-        prompt.append({"role": "user", "content": example["problem"]})
+        content = None
+        match script_args.dataset_name.split("/")[-1]:
+            case "OpenR1-Math-220k":
+                content = example["problem"]
+            case "gsm8k":
+                content = example["question"]
+            case _:
+                raise ValueError(f"Dataset {script_args.dataset_name} not supported")
+                import pdb
+
+                pdb.set_trace()
+        prompt.append({"role": "user", "content": content})
         return {"prompt": prompt}
 
     dataset = dataset.map(make_conversation)
@@ -211,12 +244,45 @@ def main(script_args, training_args, model_args):
     #############################
     # Initialize the GRPO trainer
     #############################
+    model_init_kwargs = training_args.model_init_kwargs or {}
+    model_name_or_path = model_args.model_name_or_path
+    torch_dtype = model_init_kwargs.get("torch_dtype")
+    if (
+        isinstance(torch_dtype, torch.dtype)
+        or torch_dtype == "auto"
+        or torch_dtype is None
+    ):
+        pass  # torch_dtype is already a torch.dtype or "auto" or None
+    elif isinstance(torch_dtype, str):  # it's a str, but not "auto"
+        torch_dtype = getattr(torch, torch_dtype)
+        model_init_kwargs["torch_dtype"] = torch_dtype
+    else:
+        raise ValueError(
+            "Invalid `torch_dtype` passed to `GRPOConfig`. Expected either 'auto' or a string representing "
+            f"a `torch.dtype` (e.g., 'float32'), but got {torch_dtype}."
+        )
+    # Disable caching if gradient checkpointing is enabled (not supported)
+    model_init_kwargs["use_cache"] = (
+        False
+        if training_args.gradient_checkpointing
+        else model_init_kwargs.get("use_cache")
+    )
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name_or_path, **model_init_kwargs
+    )
+    training_args.model_init_kwargs = None
+    # model = LMWrapper(model)
+
     trainer = GRPOTrainer(
-        model=model_args.model_name_or_path,
+        model=model,
         reward_funcs=reward_funcs,
         args=training_args,
         train_dataset=dataset[script_args.dataset_train_split],
-        eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
+        eval_dataset=(
+            dataset[script_args.dataset_test_split]
+            if training_args.eval_strategy != "no"
+            else None
+        ),
         peft_config=get_peft_config(model_args),
         callbacks=get_callbacks(training_args, model_args),
         processing_class=tokenizer,
